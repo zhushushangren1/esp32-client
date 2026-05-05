@@ -2,49 +2,81 @@
 #include <WiFi.h>
 #include "TM1637Display.h"
 
-// ============ 客户端ID配置 ============
-// 三个客户端分别设置为 "client1", "client2", "client3"
-const char* CLIENT_ID = "client2";  // 根据实际设备修改此值
-// ========================================
+const char* CLIENT_ID = "client3";
 
-// 按钮引脚定义
-#define BTN_RED_PIN    12  // D12 - 红色方计分按钮（+1）
-#define BTN_BLUE_PIN   14  // D14 - 蓝色方计分按钮（+1）
-#define BTN_RESET_PIN  13  // D13 - 重置按钮（绿色）
-#define BTN_RED_PLUS2   27  // D27 - 红色方计分按钮（+2）
-#define BTN_BLUE_PLUS2  26  // D26 - 蓝色方计分按钮（+2）
+#define BTN_RED_PIN     12
+#define BTN_BLUE_PIN    14
+#define BTN_RESET_PIN   13
+#define BTN_RED_PLUS2   27
+#define BTN_BLUE_PLUS2  26
 
-// TM1637数码管引脚定义
-#define TM1637_CLK    2   // D2 - 时钟引脚
-#define TM1637_DIO    15  // D15 - 数据引脚
+#define TM1637_CLK      2
+#define TM1637_DIO      15
 
-// 计数器变量
+const char* ssid = "ScoreSystem";
+const char* password = "12345678";
+const char* host = "192.168.4.1";
+const int port = 80;
+
 int redCount = 0;
 int blueCount = 0;
 
-// 按钮状态变量
 bool redReleased = true;
 bool blueReleased = true;
 bool resetReleased = true;
 bool redPlus2Released = true;
 bool bluePlus2Released = true;
 
-// WiFi配置
-const char* ssid = "ScoreSystem";
-const char* password = "12345678";
-const char* host = "192.168.4.1";  // score_system的AP IP地址
-const int port = 80;
+bool submissionLocked = false;
+unsigned long lockedRoundId = 0;
+unsigned long lastRoundStatusCheck = 0;
+const unsigned long ROUND_STATUS_INTERVAL_MS = 1000;
+unsigned long lastDisplayRefresh = 0;
+const unsigned long DISPLAY_REFRESH_INTERVAL_MS = 500;
 
-// TM1637显示器对象
+
 TM1637Display display(TM1637_CLK, TM1637_DIO);
 
-// 检测按钮是否被按下
 bool isButtonPressed(int pin) {
     return digitalRead(pin) == LOW;
 }
 
-// 在数码管上显示比分（未连接WiFi时显示FFFF作为连接状态提示）
+unsigned long extractJsonUnsignedLong(const String& body, const char* key) {
+    String marker = "\"" + String(key) + "\":";
+    int start = body.indexOf(marker);
+    if (start < 0) {
+        return 0;
+    }
+
+    start += marker.length();
+    while (start < body.length() && body[start] == ' ') {
+        start++;
+    }
+
+    int end = start;
+    while (end < body.length() && isDigit(body[end])) {
+        end++;
+    }
+
+    if (end == start) {
+        return 0;
+    }
+
+    return body.substring(start, end).toInt();
+}
+
+void displayLockedState() {
+    const uint8_t DASH = 0x40;
+    uint8_t segs[4] = {DASH, DASH, DASH, DASH};
+    display.setSegments(segs, 4);
+}
+
 void displayScore() {
+    if (submissionLocked) {
+        displayLockedState();
+        return;
+    }
+
     if (WiFi.status() != WL_CONNECTED) {
         uint8_t segs[4] = {
             display.encodeDigit(0xF),
@@ -56,21 +88,41 @@ void displayScore() {
         return;
     }
 
-    // 4位数码管：前两位显示红色方，后两位显示蓝色方
-    // 限制分数在0-99范围内
     int red = constrain(redCount, 0, 99);
     int blue = constrain(blueCount, 0, 99);
 
     uint8_t digits[4];
-    digits[0] = display.encodeDigit(red / 10);      // 红色方十位
-    digits[1] = display.encodeDigitWithDot(red % 10);  // 红色方个位（带小数点形成冒号效果）
-    digits[2] = display.encodeDigit(blue / 10);     // 蓝色方十位
-    digits[3] = display.encodeDigit(blue % 10);     // 蓝色方个位
-
+    digits[0] = display.encodeDigit(red / 10);
+    digits[1] = display.encodeDigitWithDot(red % 10);
+    digits[2] = display.encodeDigit(blue / 10);
+    digits[3] = display.encodeDigit(blue % 10);
     display.setSegments(digits, 4);
 }
 
-// 通过WiFi发送比分到score_system
+bool readHttpBody(WiFiClient& client, String& body) {
+    unsigned long timeout = millis();
+    while (client.connected() && !client.available()) {
+        if (millis() - timeout > 2000) {
+            return false;
+        }
+        delay(1);
+    }
+
+    bool inBody = false;
+    while (client.connected() || client.available()) {
+        String line = client.readStringUntil('\n');
+        if (!inBody) {
+            if (line == "\r" || line.length() == 0) {
+                inBody = true;
+            }
+            continue;
+        }
+        body += line;
+    }
+
+    return true;
+}
+
 bool sendScoreToServer(int red, int blue) {
     if (WiFi.status() != WL_CONNECTED) {
         Serial.println("WiFi not connected, skip send");
@@ -78,91 +130,159 @@ bool sendScoreToServer(int red, int blue) {
     }
 
     WiFiClient client;
+    Serial.println("Connecting to server...");
+    Serial.flush();
     if (!client.connect(host, port)) {
         Serial.println("Connection to server failed!");
         return false;
     }
+    Serial.println("Server TCP connected");
+    Serial.flush();
 
-    // 发送HTTP GET请求（带上客户端ID）
-    String url = "/updateScore?client=" + String(CLIENT_ID) + "&red=" + String(red) + "&blue=" + String(blue);
+    String url = "/updateScore?client=" + String(CLIENT_ID) +
+                 "&red=" + String(red) +
+                 "&blue=" + String(blue);
     client.print(String("GET ") + url + " HTTP/1.1\r\n" +
                  "Host: " + String(host) + "\r\n" +
                  "Connection: close\r\n\r\n");
 
     Serial.print("Sent: ");
     Serial.println(url);
+    Serial.flush();
 
-    // 等待响应（最多2秒，避免长时间阻塞loop）
-    unsigned long timeout = millis();
-    while (client.available() == 0) {
-        if (millis() - timeout > 2000) {
-            Serial.println("Server response timeout!");
-            client.stop();
-            return false;
-        }
-        delay(1);  // 让出 CPU 给 WiFi 栈
-    }
-
-    // 读取响应（简化处理）
-    while (client.available()) {
-        String line = client.readStringUntil('\n');
-        if (line.startsWith("{\"ok\"")) {
-            Serial.println("Server response: OK");
-        }
+    String body;
+    if (!readHttpBody(client, body)) {
+        Serial.println("Server response timeout!");
+        client.stop();
+        return false;
     }
 
     client.stop();
+
+    if (body.indexOf("\"ok\":true") >= 0) {
+        Serial.println("Server response: OK");
+        Serial.flush();
+        lockedRoundId = extractJsonUnsignedLong(body, "roundId");
+        return true;
+    }
+
+    Serial.print("Server rejected request: ");
+    Serial.println(body);
+    return false;
+}
+
+bool fetchRoundStatus(bool& roundOpen, bool& submitted, unsigned long& statusRoundId) {
+    if (WiFi.status() != WL_CONNECTED) {
+        return false;
+    }
+
+    WiFiClient client;
+    if (!client.connect(host, port)) {
+        return false;
+    }
+
+    client.print(String("GET /roundStatus?client=") + String(CLIENT_ID) + " HTTP/1.1\r\n" +
+                 "Host: " + String(host) + "\r\n" +
+                 "Connection: close\r\n\r\n");
+
+    String body;
+    if (!readHttpBody(client, body)) {
+        client.stop();
+        return false;
+    }
+
+    client.stop();
+
+    if (body.indexOf("\"roundOpen\":true") >= 0) {
+        roundOpen = true;
+    } else if (body.indexOf("\"roundOpen\":false") >= 0) {
+        roundOpen = false;
+    } else {
+        return false;
+    }
+
+    submitted = (body.indexOf("\"submitted\":true") >= 0);
+    statusRoundId = extractJsonUnsignedLong(body, "roundId");
     return true;
+}
+
+void unlockForNextRound() {
+    submissionLocked = false;
+    lockedRoundId = 0;
+    redCount = 0;
+    blueCount = 0;
+    Serial.println("Next round opened. Ready for scoring.");
+    displayScore();
+}
+
+void pollRoundStatusIfNeeded() {
+    if (!submissionLocked) {
+        return;
+    }
+
+    if (millis() - lastRoundStatusCheck < ROUND_STATUS_INTERVAL_MS) {
+        return;
+    }
+    lastRoundStatusCheck = millis();
+
+    bool roundOpen = false;
+    bool submitted = true;
+    unsigned long statusRoundId = 0;
+    if (fetchRoundStatus(roundOpen, submitted, statusRoundId) &&
+        roundOpen &&
+        (!submitted || (lockedRoundId != 0 && statusRoundId != lockedRoundId))) {
+        unlockForNextRound();
+    }
+}
+
+void refreshDisplayIfNeeded() {
+    if (millis() - lastDisplayRefresh < DISPLAY_REFRESH_INTERVAL_MS) {
+        return;
+    }
+    lastDisplayRefresh = millis();
+
+    if (submissionLocked || WiFi.status() != WL_CONNECTED) {
+        displayScore();
+    }
 }
 
 void setup() {
     Serial.begin(115200);
-    
-    // 设置所有按钮引脚为输入模式，启用内部上拉电阻
+    delay(200);
+
     pinMode(BTN_RED_PIN, INPUT_PULLUP);
     pinMode(BTN_BLUE_PIN, INPUT_PULLUP);
     pinMode(BTN_RESET_PIN, INPUT_PULLUP);
     pinMode(BTN_RED_PLUS2, INPUT_PULLUP);
     pinMode(BTN_BLUE_PLUS2, INPUT_PULLUP);
-    
-    // 初始化TM1637显示器
-    display.setBrightness(0x07);  // 设置亮度
 
-    // 初始显示（WiFi尚未连接时会显示 FFFF 作为未就绪提示）
+    display.setBrightness(0x07);
     displayScore();
 
-    // 启动WiFi（非阻塞，后台自动重连）
     WiFi.mode(WIFI_STA);
     WiFi.setAutoReconnect(true);
     WiFi.persistent(false);
+    WiFi.setSleep(false);
+    WiFi.setTxPower(WIFI_POWER_2dBm);
     WiFi.begin(ssid, password);
     Serial.println("WiFi: connecting to ScoreSystem in background...");
 
-    // 等待引脚稳定，避免启动时误触发
     delay(100);
-    
-    // 读取初始按钮状态，防止启动时误触发
+
     redReleased = !isButtonPressed(BTN_RED_PIN);
     blueReleased = !isButtonPressed(BTN_BLUE_PIN);
     resetReleased = !isButtonPressed(BTN_RESET_PIN);
     redPlus2Released = !isButtonPressed(BTN_RED_PLUS2);
     bluePlus2Released = !isButtonPressed(BTN_BLUE_PLUS2);
-    
+
     Serial.println("=== Score System Ready ===");
     Serial.print("Client ID: ");
     Serial.println(CLIENT_ID);
-    Serial.println("Red +1: GPIO12 (D12)");
-    Serial.println("Blue +1: GPIO14 (D14)");
-    Serial.println("Red +2: GPIO27 (D27)");
-    Serial.println("Blue +2: GPIO26 (D26)");
-    Serial.println("Reset/Send: GPIO13 (D13)");
-    Serial.println("Display: TM1637 (CLK=D2, DIO=D15)");
     Serial.println("==========================");
     Serial.flush();
 }
 
 void loop() {
-    // 检测WiFi连接状态变化：断开→显示FFFF，连上→刷新为当前分数
     static bool lastConnected = false;
     bool nowConnected = (WiFi.status() == WL_CONNECTED);
     if (nowConnected != lastConnected) {
@@ -176,10 +296,17 @@ void loop() {
         displayScore();
     }
 
-    // 检测红色方按钮
+    pollRoundStatusIfNeeded();
+    refreshDisplayIfNeeded();
+
+    if (submissionLocked) {
+        delay(10);
+        return;
+    }
+
     if (isButtonPressed(BTN_RED_PIN)) {
         if (redReleased) {
-            delay(50);  // 消抖
+            delay(50);
             if (isButtonPressed(BTN_RED_PIN)) {
                 redCount++;
                 Serial.print("Red +1 | Score: ");
@@ -187,19 +314,17 @@ void loop() {
                 Serial.print(" - ");
                 Serial.print(blueCount);
                 Serial.println(" | Blue");
-                Serial.flush();
-                displayScore();  // 更新显示
+                displayScore();
                 redReleased = false;
             }
         }
     } else {
         redReleased = true;
     }
-    
-    // 检测蓝色方按钮
+
     if (isButtonPressed(BTN_BLUE_PIN)) {
         if (blueReleased) {
-            delay(50);  // 消抖
+            delay(50);
             if (isButtonPressed(BTN_BLUE_PIN)) {
                 blueCount++;
                 Serial.print("Blue +1 | Score: ");
@@ -207,19 +332,17 @@ void loop() {
                 Serial.print(" - ");
                 Serial.print(blueCount);
                 Serial.println(" | Blue");
-                Serial.flush();
-                displayScore();  // 更新显示
+                displayScore();
                 blueReleased = false;
             }
         }
     } else {
         blueReleased = true;
     }
-    
-    // 检测红色方+2按钮
+
     if (isButtonPressed(BTN_RED_PLUS2)) {
         if (redPlus2Released) {
-            delay(50);  // 消抖
+            delay(50);
             if (isButtonPressed(BTN_RED_PLUS2)) {
                 redCount += 2;
                 Serial.print("Red +2 | Score: ");
@@ -227,19 +350,17 @@ void loop() {
                 Serial.print(" - ");
                 Serial.print(blueCount);
                 Serial.println(" | Blue");
-                Serial.flush();
-                displayScore();  // 更新显示
+                displayScore();
                 redPlus2Released = false;
             }
         }
     } else {
         redPlus2Released = true;
     }
-    
-    // 检测蓝色方+2按钮
+
     if (isButtonPressed(BTN_BLUE_PLUS2)) {
         if (bluePlus2Released) {
-            delay(50);  // 消抖
+            delay(50);
             if (isButtonPressed(BTN_BLUE_PLUS2)) {
                 blueCount += 2;
                 Serial.print("Blue +2 | Score: ");
@@ -247,35 +368,27 @@ void loop() {
                 Serial.print(" - ");
                 Serial.print(blueCount);
                 Serial.println(" | Blue");
-                Serial.flush();
-                displayScore();  // 更新显示
+                displayScore();
                 bluePlus2Released = false;
             }
         }
     } else {
         bluePlus2Released = true;
     }
-    
-    // 检测重置按钮（绿色按钮）- 发送比分后重置
+
     if (isButtonPressed(BTN_RESET_PIN)) {
         if (resetReleased) {
-            delay(50);  // 消抖
+            delay(50);
             if (isButtonPressed(BTN_RESET_PIN)) {
                 Serial.println("Green button pressed - Sending score to server...");
                 Serial.flush();
 
-                // 发送比分到server，仅在成功时才清零
                 if (sendScoreToServer(redCount, blueCount)) {
                     Serial.println("Score sent successfully!");
-                    redCount = 0;
-                    blueCount = 0;
-                    Serial.println("Reset! Score: 0 - 0");
-                    Serial.flush();
-                    displayScore();  // 更新显示为0000
+                    submissionLocked = true;
+                    displayScore();
                 } else {
                     Serial.println("Failed to send score! Score kept for retry.");
-                    Serial.flush();
-                    // 发送失败：保留分数，闪烁一下提示用户
                     for (int i = 0; i < 2; i++) {
                         display.clear();
                         delay(100);
@@ -290,6 +403,6 @@ void loop() {
     } else {
         resetReleased = true;
     }
-    
+
     delay(10);
 }
